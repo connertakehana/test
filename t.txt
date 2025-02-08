@@ -1,233 +1,211 @@
 #pragma once
-#include <thrust/complex.h>
+#include <stdio.h>
 #include "thunderkittens.hpp"
 
 using namespace kittens;
 
-constexpr int CONSUMER_WARPGROUPS = 3;
-constexpr int PRODUCER_WARPGROUPS = 1;
+// Customize these to your liking
+constexpr int CONSUMER_WARPGROUPS = 3;  // # HPC warpgroups that do the final LSE accumulation
+constexpr int PRODUCER_WARPGROUPS = 1;  // # HPC warpgroups that do TMA loads
 constexpr int NUM_WARPGROUPS      = (CONSUMER_WARPGROUPS + PRODUCER_WARPGROUPS);
 constexpr int NUM_WORKERS         = (NUM_WARPGROUPS * WARPGROUP_WARPS);
 
-// Simple compile-time struct to define tile dimensions for the reduction:
-template<int BLOCK_M_, int HEAD_DIM_, int MAX_SPLITS_>
-struct final_reduce_tile {
-   static constexpr int BLOCK_M   = BLOCK_M_;
-   static constexpr int HEAD_DIM  = HEAD_DIM_;
-   static constexpr int MAX_SPLITS = MAX_SPLITS_;
+// We'll double-buffer partial LSE in shared memory
+constexpr int STAGES = 2;
+
+//-----------------------------------------------------
+// 2.1. Define a struct to hold the “globals” for TMA descriptors
+//-----------------------------------------------------
+template<int ROWS_>
+struct final_lse_reduce_globals {
+    // partial_lse shape: [num_chunks, ROWS_]
+    // final_lse shape:   [ROWS_]
+    using partial_tile = st_fl<ROWS_, 1>;  // We'll store chunk of partial LSE as 2D (ROWS_ x 1)
+    using final_tile   = st_fl<ROWS_, 1>;  // We'll store final LSE as 2D (ROWS_ x 1)
+
+    using partial_lse_gl = gl<float, -1, -1, -1, -1, partial_tile>;
+    using final_lse_gl   = gl<float, -1, -1, -1, -1, final_tile>;
+
+    partial_lse_gl partial_lse;  // global descriptor for partial LSE
+    final_lse_gl   final_lse;    // global descriptor for final LSE
+
+    int num_chunks; // how many partial-lse chunks we want to combine
+    int ROWS;       // must match ROWS_, but can be used for bound-checks
 };
 
-// “Globals” structure for the kernel:
-template<int BLOCK_M, int HEAD_DIM, int MAX_SPLITS>
-struct final_reduce_globals {
-   // partial LSE pointer: shape [num_splits, BLOCK_M] in floating type
-   // partial O pointer:   shape [num_splits, BLOCK_M, HEAD_DIM] in some type (bf16 or float)
-   // final LSE pointer:   shape [BLOCK_M]
-   // final O pointer:     shape [BLOCK_M, HEAD_DIM]
+//-----------------------------------------------------
+// 2.2. The kernel
+//-----------------------------------------------------
+template<int ROWS>
+__global__ __launch_bounds__(NUM_WORKERS * WARP_THREADS, 1)
+void final_lse_reduce_ker(const __grid_constant__ final_lse_reduce_globals<ROWS> g)
+{
+    // HPC identification
+    int warpid       = kittens::warpid();                // 0..(NUM_WORKERS-1)
+    int warpgroupid  = warpid / WARPGROUP_WARPS;         // 0..(NUM_WARPGROUPS-1)
+    int localwarp    = warpid % WARPGROUP_WARPS;         // which warp inside that HPC warpgroup
 
-   // ThunderKittens "global" descriptors:
-   using partial_lse_tile = st_fl<MAX_SPLITS, BLOCK_M>;           // partial LSE in float
-   using partial_o_tile   = st_fl<MAX_SPLITS*BLOCK_M, HEAD_DIM>;  // partial O in float (or bf16)
-   using final_lse_tile   = st_fl<BLOCK_M, 1>;
-   using final_o_tile     = st_fl<BLOCK_M, HEAD_DIM>;
+    // We'll allocate the double-buffer partial-lse in shared memory
+    extern __shared__ int __shm[]; 
+    tma_swizzle_allocator al((int*)&__shm[0]);
 
-   using partial_lse_gl = gl<float, -1, -1, -1, -1, partial_lse_tile>;
-   using partial_o_gl   = gl<float, -1, -1, -1, -1, partial_o_tile>;
-   using final_lse_gl   = gl<float, -1, -1, -1, -1, final_lse_tile>;
-   using final_o_gl     = gl<float, -1, -1, -1, -1, final_o_tile>;
+    // Type we store in SMEM for partial-lse chunk
+    using partial_tile = st_fl<ROWS, 1>;
 
-   partial_lse_gl partial_lse;
-   partial_o_gl   partial_o;
-   final_lse_gl   final_lse;
-   final_o_gl     final_o;
+    // We'll have an array of [STAGES] partial tiles in shared memory
+    partial_tile (&partial_smem)[STAGES] = al.allocate<partial_tile, STAGES>();
 
-   int num_splits;   // actual number of splits to combine
-   int row_offset;   // offset for the block in the LSE/O dimension
-   int total_rows;   // total rows (like b*h*seqlen_q in your example)
-};
+    //-----------------------------------------------------
+    // HPC semaphores
+    //-----------------------------------------------------
+    // We'll need:
+    //   partial_smem_arrived[stage]  => indicates partial-lse chunk is loaded
+    //   compute_done[stage]          => indicates consumers are done with that chunk
+    // So the producer doesn't overwrite it.
+    __shared__ kittens::semaphore partial_smem_arrived[STAGES], compute_done[STAGES];
+    if (threadIdx.x == 0) {
+        for(int s=0; s<STAGES; s++){
+            init_semaphore(partial_smem_arrived[s], 0, 1); 
+            init_semaphore(compute_done[s], CONSUMER_WARPGROUPS, 0);
+        }
+    }
+    __syncthreads();
 
+    //-----------------------------------------------------
+    // *** Producer warpgroup *** => last HPC warpgroup
+    //-----------------------------------------------------
+    if (warpgroupid == NUM_WARPGROUPS - 1) {
+        // Usually we reduce register usage, as we just do memory ops
+        warpgroup::decrease_registers<64>();
 
+        // We'll do a pipeline over each chunk c = 0..(g.num_chunks-1)
+        // We store it in partial_smem[c % STAGES].
+        for (int c = 0; c < g.num_chunks; c++){
+            int stage = c % STAGES;
 
-template<int BLOCK_M, int HEAD_DIM, int MAX_SPLITS>
-__global__ __launch_bounds__((NUM_WORKERS)*WARP_THREADS, 1)
-void final_attn_reduce_ker(const __grid_constant__ final_reduce_globals<BLOCK_M, HEAD_DIM, MAX_SPLITS> g) {
+            // Wait for the consumer to be done with this stage (unless c < STAGES)
+            if (c >= STAGES) {
+                wait(compute_done[stage], /*index=*/ (c / STAGES) % 2);
+            }
 
-   // 1) Access the HPC “warpgroupid” to decide if we’re a “producer” or “consumer”
-   int warpid       = warpid();
-   int warpgroupid  = warpid / WARPGROUP_WARPS;
+            // Now we can load chunk c into partial_smem[stage]
+            if (warpid == (NUM_WORKERS - 4)) {
+                // We'll pick 1 warp (or a subset) to do the TMA call (example).
+                // The coordinate must match partial_lse shape
+                coord<partial_tile> tile_coord = { c, 0 }; 
+                // Fill out-of-range with -∞ if c >= g.num_chunks, or rows > g.ROWS
+                float neg_inf = base_types::constants<float>::neg_infty();
 
-   // 2) Allocate shared memory with TMA-swizzle:
-   extern __shared__ int __shm[];
-   tma_swizzle_allocator al((int*)&__shm[0]);
+                tma::expect_bytes(partial_smem_arrived[stage], sizeof(partial_tile));
+                tma::load_async(partial_smem[stage], g.partial_lse, tile_coord, partial_smem_arrived[stage], neg_inf);
+            }
+        }
+        // After finishing all loads, we do no more. The consumer will eventually read the last chunk(s).
 
-   // We store partial LSE in [MAX_SPLITS, BLOCK_M]
-   // We store partial O in [MAX_SPLITS*BLOCK_M, HEAD_DIM]
-   using partial_lse_tile = st_fl<MAX_SPLITS, BLOCK_M>;
-   using partial_o_tile   = st_fl<MAX_SPLITS*BLOCK_M, HEAD_DIM>;
-   using final_lse_tile   = st_fl<BLOCK_M, 1>;
-   using final_o_tile     = st_fl<BLOCK_M, HEAD_DIM>;
+    //-----------------------------------------------------
+    // *** Consumer warpgroup *** => gather partial-lse
+    //-----------------------------------------------------
+    } else {
+        // Possibly we increase registers for HPC compute
+        warpgroup::increase_registers<128>();
 
-   partial_lse_tile &lse_smem = al.allocate<partial_lse_tile, 1>()[0];
-   partial_o_tile   &o_smem   = al.allocate<partial_o_tile,   1>()[0];
+        // We'll hold the final row-wise LSE in registers:
+        // We'll do the stable running approach:
+        //   maxval[r], sumExp[r]
+        // so final_lse[r] = log( sumExp[r] ) + maxval[r]
+        // If sumExp[r] == 0 => final_lse[r] = -∞ (or handle corner cases).
+        // For HPC demonstration, let's store them in arrays dimension [some small #].
+        float maxval[ROWS], sumExp[ROWS];
+        for (int r = 0; r < ROWS; r++){
+            maxval[r] = base_types::constants<float>::neg_infty(); // -∞
+            sumExp[r] = 0.f;
+        }
 
-   // We'll also reuse part of lse_smem or o_smem for final LSE / final O if we want.
-   final_lse_tile *lse_out_smem = reinterpret_cast<final_lse_tile*>(&lse_smem);
-   final_o_tile   *o_out_smem   = reinterpret_cast<final_o_tile*>(&o_smem);
+        // We'll process each chunk c in turn
+        for (int c = 0; c < g.num_chunks; c++){
+            int stage = c % STAGES;
 
-   // 3) Setup HPC semaphores for producer/consumer
-   __shared__ semaphore lse_smem_arrived, o_smem_arrived, compute_done;
-   if (threadIdx.x == 0) {
-       init_semaphore(lse_smem_arrived, 0, 1);
-       init_semaphore(o_smem_arrived,   0, 1);
-       init_semaphore(compute_done, CONSUMER_WARPGROUPS, 0);
+            // Wait for partial-lse chunk c to arrive in partial_smem[stage]
+            wait(partial_smem_arrived[stage], (c / STAGES) % 2);
 
-       // Producer (thread 0 in the block) schedules TMA loads.
-       // We read partial LSE from “g.partial_lse” into “lse_smem”.
-       // We read partial O from “g.partial_o” into “o_smem”.
-       // We do 1 async load if shapes fit, or multiple if needed.
-       coord<partial_lse_tile> lse_coord = {0, g.row_offset};
-       // Fill outside range with negative infinity:
-       float neg_inf = base_types::constants<float>::neg_infty();
+            // Now partial_smem[stage](row,0) is the partial LSE for chunk c
+            // We do running stable sum:
+            //   let x = partial_smem[stage](row,0)
+            //   oldMax = maxval[row]
+            //   newMax = max(oldMax, x)
+            //   sumExp[row] = sumExp[row]*exp(oldMax - newMax) + exp(x - newMax)
+            //   maxval[row] = newMax
 
-       // TMA load the partial LSE
-       tma::expect_bytes(lse_smem_arrived, sizeof(lse_smem));
-       tma::load_async(lse_smem, g.partial_lse, lse_coord, lse_smem_arrived, neg_inf);
+            // We'll do it HPC style: each HPC warpgroup handles some subset of rows.
+            // For example, row r in [warpgroupid, warpgroupid+CONSUMER_WARPGROUPS, ...].
+            // We'll do a for-loop:
+            for (int r = warpgroupid; r < ROWS; r += CONSUMER_WARPGROUPS) {
+                // load partial-lse
+                float x = partial_smem[stage](r, 0);
 
-       // TMA load the partial O
-       coord<partial_o_tile> o_coord = {0, 0};
-       // If partial_o is shaped [MAX_SPLITS, BLOCK_M, HEAD_DIM], you’d adapt the coordinate
-       // For simplicity we flatten it, so something like:
-       //    row_offset -> g.row_offset * HEAD_DIM
-       // but let's keep it symbolic:
-       float zero = base_types::constants<float>::zero();
-       tma::expect_bytes(o_smem_arrived, sizeof(o_smem));
-       tma::load_async(o_smem, g.partial_o, o_coord, o_smem_arrived, zero);
-   }
-   __syncthreads();
+                // do the stable sum
+                float oldMax = maxval[r];
+                float newMax = (x > oldMax) ? x : oldMax;
+                float scaleOld = expf(oldMax - newMax);
+                float scaleNew = expf(x      - newMax);
+                sumExp[r] = sumExp[r]*scaleOld + scaleNew;
+                maxval[r] = newMax;
+            }
 
-   // 4) Producer Warpgroup vs. Consumer Warpgroups
-   if (warpgroupid == NUM_WARPGROUPS-1) {
-       // Producer warpgroup: If we had multiple partial TMA loads, we’d pipeline them here.
-       // Example: reading multiple big tiles in a loop, waiting for compute_done each time
-       // But for brevity, let’s say we do only a single tile. So we do nothing.
-   } else {
-       // Consumer warpgroups: Do the final LSE reduce + O scale
-       warpgroup::increase_registers<80>(); // just an example
+            // HPC warpgroup sync so that we don't overwrite partial_smem if multiple warps read it
+            warpgroup::sync();
+            
+            // Done reading chunk c => let the producer reuse partial_smem[stage]
+            if (warpgroup::laneid() == 0) {
+                arrive(compute_done[stage], 1);
+            }
+        }
 
-       // Wait for partial LSE / O to arrive in shared memory
-       wait(lse_smem_arrived, 0);
-       wait(o_smem_arrived,   0);
+        // Now we've combined all chunks. We have final:
+        //   final_lse[r] = log(sumExp[r]) + maxval[r].
+        // We'll store that in shared memory or directly TMA store.
 
-       //--------------------------------------
-       // STEP A) Combine partial LSE across splits
-       // lse_smem: shape [MAX_SPLITS, BLOCK_M]
-       // We only actually have “g.num_splits” valid splits.
-       // We do the standard log-sum-exp reduce:
-       //   final_lse_row = log( \sum_{split=0..num_splits-1} exp(lse_smem[split, row]) )
-       // We do it row by row, with HPC warp ops.
-       //--------------------------------------
+        // We'll do a quick HPC approach if we want each HPC warpgroup to handle different row. 
+        // Then we store to global memory. Let's gather them in shared memory first, or store direct.
 
-       // We'll handle “BLOCK_M” rows. Each warp can handle a subset, or
-       // we can do a row-wise reduce with HPC warp instructions.
+        // Example: store direct from each HPC warpgroup’s lanes. Then we do a second HPC approach
+        // if we must. For simplicity, we do a lane = 0 store.
 
-       for (int row = warpgroup::laneid(); row < BLOCK_M; row += warpgroup::lanes()) {
-           // 1) find max across splits
-           float lse_max = base_types::constants<float>::neg_infty();
-           for(int s = 0; s < g.num_splits; s++) {
-               float val = lse_smem(s, row);
-               lse_max   = max(lse_max, val);
-           }
-           // HPC warpgroup reduce max among all lanes
-           warpgroup::reduce_max(lse_max);
+        // Wait for all HPC warpgroups to finish the for-loops. (We do a block-level barrier.)
+        // But in HPC style, we can do warpgroup::sync(WARPGROUP_BARRIER) for block-level. 
+        // Or simpler, __syncthreads() if we can. HPC has a utility but let's do __syncthreads here.
+        __syncthreads();
 
-           // 2) sum of exp(lse_smem[s, row] - lse_max)
-           float exp_sum = 0.f;
-           for(int s = 0; s < g.num_splits; s++) {
-               float val = lse_smem(s, row);
-               exp_sum  += expf(val - lse_max);
-           }
-           warpgroup::reduce_add(exp_sum);
+        // Now store final LSE. We'll do a loop over the rows we own again:
+        for (int r = warpgroupid; r < ROWS; r += CONSUMER_WARPGROUPS) {
+            // final = log(sumExp[r]) + maxval[r]
+            float finalVal = (sumExp[r] <= 0.f)
+                             ? base_types::constants<float>::neg_infty()
+                             : logf(sumExp[r]) + maxval[r];
 
-           // 3) final log-sum
-           float final_log_sum = (exp_sum == 0.f) ? base_types::constants<float>::neg_infty()
-                                                  : logf(exp_sum) + lse_max;
+            // TMA store can be done from lane 0 or any lane. We'll pick lane 0:
+            if (localwarp == 0) {
+                // We'll place it in a st_fl<ROWS,1> tile in shared memory temporarily:
+                partial_tile final_smem;
+                final_smem(r, 0) = finalVal;
+                
+                // The rest of the rows get 0 or -∞. 
+                // If we want a complete tile, we should fill them, or do bounding in TMA.
+                // For simplicity, store only row r, fill out-of-range with -∞:
+                for(int rr=0; rr<ROWS; rr++){
+                    if(rr != r) final_smem(rr,0) = base_types::constants<float>::neg_infty();
+                }
 
-           // store in shared memory (so we can use it to scale partial O)
-           // let's reuse row 0 in lse_smem for that, or store in lse_out_smem
-           if (warpgroup::laneid() == 0) {
-               (*lse_out_smem)(row, 0) = final_log_sum; // shape is [BLOCK_M,1]
-           }
-       }
-       // Synchronize so that all lanes see the final LSE
-       warpgroup::sync();
-
-       //--------------------------------------
-       // STEP B) Scale partial O
-       // partial O is shape [MAX_SPLITS*BLOCK_M, HEAD_DIM], i.e. each row = one “(split, row)”.
-       // We want final O[row, d] = \sum_{split} e^{lse_smem[split, row] - final_lse_row} * partial_o_smem(split, row, d)
-       //--------------------------------------
-       for(int sr = warpgroup::laneid(); sr < (g.num_splits * BLOCK_M); sr += warpgroup::lanes()) {
-           int s   = sr / BLOCK_M; // which split
-           int row = sr % BLOCK_M; // which row
-           float final_log_sum = (*lse_out_smem)(row, 0); // from step A
-
-           float partial_lse   = lse_smem(s, row);
-           float scale         = expf( partial_lse - final_log_sum );
-
-           // Multiply each HEAD_DIM column by that scale:
-           for(int d = 0; d < HEAD_DIM; d++) {
-               float &ref_O = o_smem(sr, d);
-               ref_O *= scale;
-           }
-       }
-       // HPC warp sync in case we want all partial O scaled before reduction
-       warpgroup::sync();
-
-       // STEP C) Sum partial O across splits
-       // Because we stored partial O in [split, row], we can do a row-wise reduce or
-       // we can do "accumulate in place" if we do it carefully. Let's do a simple approach:
-       //   final_O[row,d] = sum_{split} partial_O[split,row,d].
-       // We'll do a pairwise reduction in shared memory, HPC style.
-
-       for(int row = 0; row < BLOCK_M; row++) {
-           // Each row has num_splits “chunks” in O. We'll do an HPC warp sum across them.
-           for(int d = warpgroup::laneid(); d < HEAD_DIM; d += warpgroup::lanes()) {
-
-               float accum = 0.f;
-               for(int s = 0; s < g.num_splits; s++) {
-                   accum += o_smem(s*BLOCK_M + row, d);
-               }
-               // We could HPC reduce across lanes if HEAD_DIM is big. For simplicity:
-               // we assume each lane gets distinct columns. If HEAD_DIM is large, use
-               // warpgroup::reduce_add(accum).
-
-               // store final O in final_o_smem
-               (*o_out_smem)(row, d) = accum;
-           }
-           warpgroup::sync(); // ensure row done
-       }
-
-       // Now we have final LSE in lse_out_smem, final O in o_out_smem.
-
-       // 5) Optionally store final outputs to global memory
-       // We do that for each warpgroup, but typically only 1 warp in each group.
-       warpgroup::sync();
-       if (warpgroup::laneid() == 0) {
-           // TMA store the final LSE:
-           coord<final_lse_tile> flse_coord = {g.row_offset, 0};
-           tma::store_async(g.final_lse, (*lse_out_smem), flse_coord);
-
-           // TMA store the final O:
-           coord<final_o_tile> fo_coord = {g.row_offset, 0};
-           tma::store_async(g.final_o, (*o_out_smem), fo_coord);
-       }
-
-       // Wait for the TMA store to complete before block ends
-       tma::store_async_wait();
-
-       // Mark compute done if we had a multi-stage pipeline
-       if (warpgroup::laneid() == 0) {
-           arrive(compute_done, 1);
-       }
-   } // end consumer warpgroups
+                // Then do TMA store_async
+                coord<partial_tile> final_coord = {0, 0}; // e.g. if final_lse is [ROWS,1] shape, or if we want offset r
+                // But we actually want to place row r in global. Usually we do {r,0} if shape is [ROWS,1].
+                // So:
+                final_coord[0] = r;
+                tma::store_async(g.final_lse, final_smem, final_coord);
+                tma::store_async_wait(); // ensure it completes
+            }
+        }
+        // HPC barrier to ensure all done
+        warpgroup::sync();
+    }
 }
